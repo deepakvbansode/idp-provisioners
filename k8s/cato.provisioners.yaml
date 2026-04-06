@@ -1,0 +1,147 @@
+# Provisions the cato-admin script as a ConfigMap and a Job that executes it.
+# Prerequisites (must exist in the cluster before applying):
+#   Secret/cato-system       — OpenSSH private key at key "cato-system"
+#   Secret/cato-connection   — SERVER_IP, SERVER_USER, SERVER_PORT env vars
+- uri: template://custom-provisioners/cato-ssh-access
+  type: cato-ssh-access
+  description: Generates a ConfigMap containing cato-admin.sh and a Job that runs it.
+  init: |
+    {{ $action := default "grant" .Params.action }}
+    {{ if not (has $action (list "grant" "revoke" "list" "dedup")) }}
+      {{ fail "params.action must be one of: grant, revoke, list, dedup" }}
+    {{ end }}
+    {{ if or (eq $action "grant") (eq $action "revoke") }}
+      {{ if not .Params.public_key }}{{ fail "params.public_key is required for grant/revoke" }}{{ end }}
+    {{ end }}
+  state: |
+    scriptName: cato-admin-script-{{ substr 0 8 .Guid | lower }}
+    jobName: cato-admin-job-{{ substr 0 8 .Guid | lower }}
+  manifests: |
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .State.scriptName }}
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+        labels:
+          app.kubernetes.io/managed-by: score-k8s
+      data:
+        cato-admin.sh: |
+          #!/bin/sh
+          # All connection details injected via env vars:
+          #   SERVER_IP, SERVER_USER, SERVER_PORT  — from Secret/cato-connection
+          #   SYSTEM_KEY                           — path to private key file
+
+          ssh_run() {
+            ssh -i "$SYSTEM_KEY" \
+                -o StrictHostKeyChecking=no \
+                -o BatchMode=yes \
+                -o ConnectTimeout=10 \
+                -p "$SERVER_PORT" \
+                "$SERVER_USER@$SERVER_IP" "$1"
+          }
+
+          grant() {
+            KEY="$1"
+            RES=$(ssh_run "
+              LINE=\$(grep -nF '$KEY' ~/.ssh/authorized_keys | head -1 | cut -d: -f1)
+              if [ -n \"\$LINE\" ]; then echo \"EXISTS:\$LINE\"; else echo '$KEY' >> ~/.ssh/authorized_keys; LINE=\$(wc -l < ~/.ssh/authorized_keys); echo \"ADDED:\$LINE\"; fi
+            ")
+            case "$RES" in
+              ADDED:*)  echo "[OK] Key added at line ${RES#ADDED:}" ;;
+              EXISTS:*) echo "[OK] Key already present at line ${RES#EXISTS:}" ;;
+              *)        echo "[ERR] Unexpected: $RES"; exit 1 ;;
+            esac
+          }
+
+          revoke() {
+            KEY="$1"
+            RES=$(ssh_run "grep -qF '$KEY' ~/.ssh/authorized_keys && { grep -vF '$KEY' ~/.ssh/authorized_keys > /tmp/ak_tmp && mv /tmp/ak_tmp ~/.ssh/authorized_keys && echo REMOVED; } || echo NOT_FOUND")
+            case "$RES" in
+              REMOVED)   echo "[OK] Key removed" ;;
+              NOT_FOUND) echo "[ERR] Key not found"; exit 1 ;;
+              *)         echo "[ERR] Unexpected: $RES"; exit 1 ;;
+            esac
+          }
+
+          list()  { ssh_run "cat ~/.ssh/authorized_keys"; }
+
+          dedup() {
+            RES=$(ssh_run "BEFORE=\$(wc -l < ~/.ssh/authorized_keys); awk '!seen[\$2]++' ~/.ssh/authorized_keys > /tmp/ak_tmp && mv /tmp/ak_tmp ~/.ssh/authorized_keys; AFTER=\$(wc -l < ~/.ssh/authorized_keys); echo \"\$BEFORE \$AFTER\"")
+            BEFORE=$(echo "$RES" | awk '{print $1}')
+            AFTER=$(echo "$RES"  | awk '{print $2}')
+            echo "[OK] Removed $((BEFORE - AFTER)) duplicate(s). $AFTER key(s) remain."
+          }
+
+          [ ! -f "$SYSTEM_KEY" ] && { echo "[ERR] System key not found: $SYSTEM_KEY"; exit 1; }
+          chmod 600 "$SYSTEM_KEY"
+
+          case "$ACTION" in
+            grant)  [ -z "$PUBKEY" ] && { echo "[ERR] PUBKEY env var required"; exit 1; }; grant "$PUBKEY" ;;
+            revoke) [ -z "$PUBKEY" ] && { echo "[ERR] PUBKEY env var required"; exit 1; }; revoke "$PUBKEY" ;;
+            list)   list ;;
+            dedup)  dedup ;;
+            *)      echo "[ERR] Unknown action: $ACTION — use grant | revoke | list | dedup"; exit 1 ;;
+          esac
+
+    - apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ .State.jobName }}
+        {{ if ne .Namespace "" }}
+        namespace: {{ .Namespace }}
+        {{ end }}
+        annotations:
+          k8s.score.dev/source-workload: {{ .SourceWorkload }}
+          k8s.score.dev/resource-uid: {{ .Uid }}
+          k8s.score.dev/resource-guid: {{ .Guid }}
+        labels:
+          app.kubernetes.io/managed-by: score-k8s
+          app.kubernetes.io/name: {{ .State.jobName }}
+      spec:
+        ttlSecondsAfterFinished: 300
+        backoffLimit: 1
+        template:
+          spec:
+            restartPolicy: Never
+            volumes:
+              - name: script
+                configMap:
+                  name: {{ .State.scriptName }}
+                  defaultMode: 0755
+              - name: cato-key
+                secret:
+                  secretName: cato-system
+                  defaultMode: 0400
+            containers:
+              - name: cato-admin
+                image: alpine:3.20
+                command: ["/bin/sh", "/scripts/cato-admin.sh"]
+                env:
+                  - name: SYSTEM_KEY
+                    value: /secrets/cato-system
+                  - name: ACTION
+                    value: {{ default "grant" .Params.action }}
+                  {{ if .Params.public_key }}
+                  - name: PUBKEY
+                    value: {{ .Params.public_key | quote }}
+                  {{ end }}
+                envFrom:
+                  - secretRef:
+                      name: cato-connection
+                volumeMounts:
+                  - name: script
+                    mountPath: /scripts
+                  - name: cato-key
+                    mountPath: /secrets
+  outputs: |
+    jobName: {{ .State.jobName }}
+    scriptName: {{ .State.scriptName }}
+  supported_params:
+    - action
+    - public_key
