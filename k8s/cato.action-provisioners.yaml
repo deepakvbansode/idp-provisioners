@@ -1,0 +1,121 @@
+# Provisions the cato-admin script as a ConfigMap and a Job that executes it.
+# Prerequisites (must exist in the cluster before applying):
+#   Secret/cato-system       — OpenSSH private key at key "cato-system"
+#   Secret/cato-connection   — SERVER_IP, SERVER_USER, SERVER_PORT env vars
+- uri: template://custom-provisioners/cato-ssh-access
+  resourceType: ssh-access
+  description: Generates a ConfigMap containing cato-admin.sh and a Job that runs it.
+  init: |
+    {{- $opMap := dict "create" "grant" "delete" "revoke" -}}
+    {{- $action := index $opMap .Operation | default .Operation -}}
+    {{- if not (has $action (list "grant" "revoke" "list" "dedup")) -}}
+      {{- fail (print "operation must map to grant/revoke/list/dedup, got: " $action) -}}
+    {{- end -}}
+    {{- if or (eq $action "grant") (eq $action "revoke") -}}
+      {{- if not (index .Params "publicKey") -}}{{- fail "spec.properties.publicKey is required for create/delete operations" -}}{{- end -}}
+    {{- end -}}
+  state: |
+    scriptName: cato-admin-script-{{ substr 0 8 .Guid | lower }}
+    jobName: cato-admin-job-{{ substr 0 8 .Guid | lower }}
+  manifests: |
+    {{- $opMap := dict "create" "grant" "delete" "revoke" -}}
+    {{- $action := index $opMap .Operation | default .Operation -}}
+    {{- $publicKey := index .Params "publicKey" | default "" -}}
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: {{ .State.scriptName }}
+      {{- if ne .Namespace "" }}
+      namespace: {{ .Namespace }}
+      {{- end }}
+      labels:
+        app.kubernetes.io/managed-by: score-k8s
+    data:
+      cato-admin.sh: |
+        #!/bin/sh
+        # All connection details injected via env vars:
+        #   SERVER_IP, SERVER_USER, SERVER_PORT  — from Secret/cato-connection
+        #   SYSTEM_KEY                           — path to private key file
+
+        ssh_run() {
+          ssh -i "$SYSTEM_KEY" \
+              -o StrictHostKeyChecking=no \
+              -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -p "$SERVER_PORT" \
+              "$SERVER_USER@$SERVER_IP" "$1"
+        }
+
+        grant() {
+          KEY="{{ $publicKey }}"
+          RES=$(ssh_run "
+            LINE=\$(grep -nF \"\$KEY\" ~/.ssh/authorized_keys | head -1 | cut -d: -f1)
+            if [ -n \"\$LINE\" ]; then echo \"EXISTS:\$LINE\"; else echo \"\$KEY\" >> ~/.ssh/authorized_keys; LINE=\$(wc -l < ~/.ssh/authorized_keys); echo \"ADDED:\$LINE\"; fi
+          ")
+          case "$RES" in
+            ADDED:*)  echo "[OK] Key added at line ${RES#ADDED:}" ;;
+            EXISTS:*) echo "[OK] Key already present at line ${RES#EXISTS:}" ;;
+            *)        echo "[ERR] Unexpected: $RES"; exit 1 ;;
+          esac
+        }
+
+        revoke() {
+          KEY="{{ $publicKey }}"
+          RES=$(ssh_run "grep -qF \"\$KEY\" ~/.ssh/authorized_keys && { grep -vF \"\$KEY\" ~/.ssh/authorized_keys > /tmp/ak_tmp && mv /tmp/ak_tmp ~/.ssh/authorized_keys && echo REMOVED; } || echo NOT_FOUND")
+          case "$RES" in
+            REMOVED)   echo "[OK] Key removed" ;;
+            NOT_FOUND) echo "[ERR] Key not found"; exit 1 ;;
+            *)         echo "[ERR] Unexpected: $RES"; exit 1 ;;
+          esac
+        }
+
+        list()  { ssh_run "cat ~/.ssh/authorized_keys"; }
+
+        dedup() {
+          RES=$(ssh_run "BEFORE=\$(wc -l < ~/.ssh/authorized_keys); awk '!seen[\$2]++' ~/.ssh/authorized_keys > /tmp/ak_tmp && mv /tmp/ak_tmp ~/.ssh/authorized_keys; AFTER=\$(wc -l < ~/.ssh/authorized_keys); echo \"\$BEFORE \$AFTER\"")
+          BEFORE=$(echo "$RES" | awk '{print $1}')
+          AFTER=$(echo "$RES" | awk '{print $2}')
+          echo "[OK] Deduped: $BEFORE -> $AFTER lines"
+        }
+
+        {{ $action }}
+    ---
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: {{ .State.jobName }}
+      {{- if ne .Namespace "" }}
+      namespace: {{ .Namespace }}
+      {{- end }}
+      labels:
+        app.kubernetes.io/managed-by: score-k8s
+    spec:
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: cato-admin
+              image: alpine:3.19
+              command: ["/bin/sh", "/scripts/cato-admin.sh"]
+              envFrom:
+                - secretRef:
+                    name: cato-connection
+              env:
+                - name: SYSTEM_KEY
+                  value: /keys/cato-system
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                - name: system-key
+                  mountPath: /keys
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: {{ .State.scriptName }}
+                defaultMode: 0755
+            - name: system-key
+              secret:
+                secretName: cato-system
+                defaultMode: 0400
